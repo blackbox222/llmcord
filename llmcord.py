@@ -3,6 +3,7 @@ import asyncio
 from base64 import b64encode
 from dataclasses import dataclass, field
 from datetime import datetime
+import glob
 import logging
 import logging.handlers
 import queue
@@ -30,11 +31,11 @@ VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "l
 EMBED_COLOR_COMPLETE = discord.Color.dark_green()
 EMBED_COLOR_INCOMPLETE = discord.Color.orange()
 
-STREAMING_INDICATOR = " ⚪"
-EDIT_DELAY_SECONDS = 2
+STREAMING_INDICATOR = " 💬 "
+EDIT_DELAY_SECONDS = 1
 
 MAX_MESSAGE_NODES = 500
-MAX_TOKENS = 1024
+MAX_TOKENS = 2048
 
 EMPTY_THOUGHT = '<|channel>thought\n<channel|>'
 
@@ -44,12 +45,12 @@ def get_config(filename: str = "config.yaml") -> dict[str, Any]:
         return yaml.safe_load(file)
 
 
-def get_system_prompt() -> str:
-    with open("prompts/system.md", encoding="utf-8") as file:
+def get_system_prompt(name: str) -> str:
+    with open(f"prompts/{name}.md", encoding="utf-8") as file:
         return file.read()
 
-system_prompt = get_system_prompt()
 config = get_config()
+system_prompt_name = config.get("system_prompt_name") or "system"
 curr_model = next(iter(config["models"]))
 
 msg_nodes = {}
@@ -62,7 +63,7 @@ model_settings = {
 
 intents = discord.Intents.default()
 intents.message_content = True
-activity = discord.CustomActivity(name=(config.get("status_message") or "github.com/jakobdylanc/llmcord")[:128])
+activity = discord.CustomActivity(name=(config.get("status_message") or "")[:128])
 discord_bot = commands.Bot(intents=intents, activity=activity, command_prefix=None)
 
 httpx_client = httpx.AsyncClient()
@@ -129,6 +130,37 @@ async def set_command(interaction: discord.Interaction, name: str, value: str) -
 @set_command.autocomplete("name")
 async def set_name_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
     return [Choice(name=f"{setting} (currently {value})", value=setting) for setting, value in model_settings.items() if curr_str.lower() in setting.lower()]
+
+
+@discord_bot.tree.command(name="system-prompt", description="Switch the current system prompt")
+async def system_prompt_command(interaction: discord.Interaction, name: str) -> None:
+    global system_prompt_name
+
+    if interaction.user.id not in config["permissions"]["users"]["admin_ids"]:
+        output = "You don't have permission to change the system prompt."
+    else:
+        name = name.replace("/", "").replace(".", "").lower().strip()
+        prompt_path = f"prompts/{name}.md"
+        if not glob.glob(prompt_path):
+            output = f"Prompt file not found: `{prompt_path}`"
+        else:
+            system_prompt_name = name
+            output = f"System prompt changed to: `{name}`"
+
+    logging.info(output)
+    await interaction.response.send_message(output, ephemeral=(interaction.channel.type == discord.ChannelType.private))
+
+
+@system_prompt_command.autocomplete("name")
+async def system_prompt_name_autocomplete(interaction: discord.Interaction, curr_str: str) -> list[Choice[str]]:
+    prompt_files = sorted(glob.glob("prompts/*.md"))
+    choices = []
+    for f in prompt_files:
+        base = f.removeprefix("prompts/").removesuffix(".md")
+        if curr_str.lower() in base.lower():
+            marker = "◉" if base == system_prompt_name else "○"
+            choices.append(Choice(name=f"{marker} {base}", value=base))
+    return choices[:25]
 
 
 @discord_bot.event
@@ -290,7 +322,7 @@ async def on_message(new_msg: discord.Message) -> None:
     temperature = model_settings.get("temperature", 1.0)
     top_p = model_settings.get("top_p", 0.949999988079071)
 
-    if system_prompt := await asyncio.to_thread(get_system_prompt):
+    if system_prompt := await asyncio.to_thread(get_system_prompt, system_prompt_name):
         now = datetime.now().astimezone()
 
         replacements = {
@@ -332,13 +364,11 @@ async def on_message(new_msg: discord.Message) -> None:
                 model=model, messages=messages[::-1], stream=True,
                 extra_headers=extra_headers, extra_query=extra_query,
                 extra_body=extra_body, temperature=temperature, top_p=top_p,
-                max_tokens=MAX_TOKENS, max_completion_tokens=MAX_TOKENS):
+                max_tokens=MAX_TOKENS, max_completion_tokens=MAX_TOKENS,
+                stream_options={"include_usage": True}):
 
-                logging.info(f"Received chunk: {chunk}")
-                if finish_reason != None:
-                    break
-
-                if not (choice := chunk.choices[0] if chunk.choices else None):
+                #logging.info(f"Received chunk: {chunk}")
+                if not chunk.usage and not (choice := chunk.choices[0] if chunk.choices else None):
                     continue
 
                 finish_reason = choice.finish_reason
@@ -363,11 +393,14 @@ async def on_message(new_msg: discord.Message) -> None:
                     msg_split_incoming = finish_reason == None and len(response_contents[-1] + curr_content) > max_message_length
                     is_final_edit = finish_reason != None or msg_split_incoming
                     is_good_finish = finish_reason != None and finish_reason.lower() in ("stop", "end_turn")
+                    has_usage = chunk.usage and chunk.usage.total_tokens > 0
 
-                    if start_next_msg or ready_to_edit or is_final_edit:
+                    if start_next_msg or ready_to_edit or is_final_edit or has_usage:
                         embed.description = response_contents[-1] if is_final_edit else (response_contents[-1] + STREAMING_INDICATOR)
-                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish else EMBED_COLOR_INCOMPLETE
+                        embed.color = EMBED_COLOR_COMPLETE if msg_split_incoming or is_good_finish or has_usage else EMBED_COLOR_INCOMPLETE
                         embed.description = embed.description.replace(EMPTY_THOUGHT, '')
+                        if has_usage:
+                            embed.set_footer(text=f"{chunk.usage.total_tokens} tokens used (input: {chunk.usage.prompt_tokens}, output: {chunk.usage.completion_tokens})")
 
                         if start_next_msg:
                             await reply_helper(embed=embed, silent=True)
