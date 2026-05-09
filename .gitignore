@@ -6,6 +6,11 @@
 
 !*.md
 !*.py
+!prompts/
+prompts/*
+!prompts/README.md
+!slopcord/
+!slopcord/*.py
 
 !Dockerfile
 !config-example.yaml

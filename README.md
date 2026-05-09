@@ -1,16 +1,22 @@
 <h1 align="center">
-  llmcord
+  slopcord: fork of llmcord
 </h1>
 
-<h3 align="center"><i>
-  Talk to LLMs with your friends!
-</i></h3>
+<h3 align="center">
+
+Talk to LLMs with your friends!<br>
+Vibe code other projects, system prompts, the Python code of the bot itself!<br>
+Let an LLM **vibe-delete** your Discord friends' home directory with tool calling!<br>
+
+</h3>
 
 <p align="center">
   <img src="https://github.com/user-attachments/assets/7791cc6b-6755-484f-a9e3-0707765b081f" alt="">
 </p>
 
-llmcord transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted.
+slopcord, based on llmcord, transforms Discord into a collaborative LLM frontend. It works with practically any LLM, remote or locally hosted.
+
+slopcord adds some new commands and **the ability to load system prompts from files.**
 
 ## Features
 
@@ -23,13 +29,13 @@ You can:
 - @ the bot while replying to ANY message to include it in the conversation
 
 Additionally:
-- When DMing the bot, conversations continue automatically (no reply required). To start a fresh conversation, just @ the bot. You can still reply to continue from anywhere.
+~~- When DMing the bot, conversations continue automatically (no reply required). To start a fresh conversation, just @ the bot.~~ You can still reply to continue from anywhere.
 - You can branch conversations into [threads](https://support.discord.com/hc/en-us/articles/4403205878423-Threads-FAQ). Just create a thread from any message and @ the bot inside to continue.
 - Back-to-back messages from the same user are automatically chained together. Just reply to the latest one and the bot will see all of them.
 
 ---
 
-### Model switching with `/model`:
+### **FIX ME!** Model switching with `/model`:
 ![image](https://github.com/user-attachments/assets/568e2f5c-bf32-4b77-ab57-198d9120f3d2)
 
 llmcord supports remote models from:
@@ -44,8 +50,26 @@ Or run local models with:
 - [Ollama](https://ollama.com)
 - [LM Studio](https://lmstudio.ai)
 - [vLLM](https://github.com/vllm-project/vllm)
+- **llama.cpp** tested with various models from HuggingFace
 
 ...Or use any other OpenAI compatible API server.
+
+---
+
+### Load system prompts from files: `/system-prompt name`
+
+Prompts should go in the `prompts/` subdir with `*.md` extensions, the file names without the extension will show up in autocomplete
+
+Set the default at start with `system_prompt_name` in config.yaml.
+
+---
+
+### **FIX ME!** Set model parameters: `/set name value`
+
+e.g. `/set temperature 1.0`
+
+These get passed in as extra fields in the create completions API.
+Defaults in the model are used, or can be specified as subkeys of `models.provider/name` in config.yaml
 
 ---
 
@@ -56,12 +80,35 @@ Or run local models with:
 - Distinguishes users via their Discord IDs
 - Streamed responses (turns green when complete, automatically splits into separate messages when too long)
 - Hot reloading config (you can change settings without restarting the bot)
-- Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
+- **FIX ME!** Displays helpful warnings when appropriate (like "⚠️ Only using last 25 messages" when the customizable message limit is exceeded)
 - Caches message data in a size-managed (no memory leaks) and mutex-protected (no race conditions) global dictionary to maximize efficiency and minimize Discord API calls
 - Fully asynchronous
-- 1 Python file, ~300 lines of code
+- 1 Python ~~file~~ module, ~300 lines of code
+-
 
-## Instructions
+---
+
+## Environment Setup
+
+```shell
+uv venv --managed-python -p 3.13
+. .venv/bin/activate
+uv pip install -U -r requirements.txt
+```
+
+## Running
+```shell
+python -m slopcord
+```
+
+### Flags
+
+* `--config FILE.yaml`: alternate config.yaml to use
+* `--invisible`: optional
+
+---
+
+## Old llmcord Instructions
 
 1. Clone the repo:
    ```bash
@@ -91,7 +138,8 @@ Or run local models with:
 | --- | --- |
 | **providers** | Add the LLM providers you want to use, each with a `base_url` and optional `api_key` entry. Popular providers (`openai`, `openrouter`, `ollama`, etc.) are already included.<br /><br />**Only supports OpenAI compatible APIs.**<br /><br />**Some providers may need `extra_headers` / `extra_query` / `extra_body` entries for extra HTTP data. See the included `azure-openai` provider for an example.** |
 | **models** | Add the models you want to use in `<provider>/<model>: <parameters>` format (examples are included). When you run `/model` these models will show up as autocomplete suggestions.<br /><br />**Refer to each provider's documentation for supported parameters.**<br /><br />**The first model in your `models` list will be the default model at startup.**<br /><br />**Some vision models may need `:vision` added to the end of their name to enable image support.** |
-| **system_prompt** | Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.** |
+| ~~**system_prompt**~~ | ~~Write anything you want to customize the bot's behavior!<br /><br />**Leave blank for no system prompt.**<br /><br />**You can use the `{date}` and `{time}` tags in your system prompt to insert the current date and time, based on your host computer's time zone.**<br /><br />**It is recommended to include something like `"User messages are prefixed with their Discord ID as <@ID>. Use this format to mention users."` in your system prompt to help the bot understand the user message format.**~~ |
+| **system_prompt_name** | Name of a `PROMPTS/*.md` without the dir name or extension to use for the system prompt. |
 
 3. Run the bot:
 
@@ -106,13 +154,13 @@ Or run local models with:
    docker compose up
    ```
 
-## Notes
+## llmcord Notes
 
 - If you're having issues, try my suggestions [here](https://github.com/jakobdylanc/llmcord/issues/19)
 
 - PRs are welcome :)
 
-## Star History
+## llmcord Star History
 
 <a href="https://star-history.com/#jakobdylanc/llmcord&Date">
   <picture>
