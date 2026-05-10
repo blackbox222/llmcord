@@ -90,6 +90,21 @@ Defaults in the model are used, or can be specified as subkeys of `models.provid
 
 ## Environment Setup
 
+Set up llama.cpp to serve an LLM from the GPU, `uv` for python, etc:
+
+```shell
+# e.g. Arch w/ CUDA
+pacman -S nvidia cuda uv python3
+
+# Homebrew
+brew install llama.cpp
+
+# Inside tmux, screen, etc.
+# e.g. for qwen3.6-35b
+llama-server -m $PATH_TO_GGUF -c 131072 -ngl all --jinja --host 0.0.0.0 --reasoning-budget 0 --reasoning off
+
+Set up a venv for slopcord:
+
 ```shell
 uv venv --managed-python -p 3.13
 . .venv/bin/activate

@@ -5,6 +5,7 @@ Handles embeds, TextDisplay, message splitting, and reply logic.
 
 from datetime import datetime
 import logging
+import io
 from typing import Any
 
 import discord
@@ -14,16 +15,29 @@ from . import constants
 log = logging.getLogger(__name__)
 
 
+def format_response(text: str) -> str:
+    return text.replace(constants.EMPTY_THOUGHT, "")
+
+
 def format_embed(
         text: str,
         finish_reason: str | None = None,
         usage: tuple[int, int] | None = None,
-        elapsed_sec: float | None = None) -> discord.Embed:
+        elapsed_sec: float | None = None,
+        tool_name: str | None = None,
+        tool_args: str | None = None) -> discord.Embed:
     """Format an LLM response into a Discord embed."""
+
+    desc = io.StringIO()
+    desc.write(format_response(text))
+    if tool_name and tool_args:
+        desc.write(constants.TOOL_INDICATOR)
+        desc.write(f"calling `{tool_name}`: `{tool_args}`\n")
+    if not finish_reason:
+        desc.write(constants.STREAMING_INDICATOR)
+
     embed = discord.Embed(
-        description=(
-            text.replace(constants.EMPTY_THOUGHT, "")
-            + (constants.STREAMING_INDICATOR if not finish_reason else "")),
+        description=desc.getvalue(),
         color=(
             constants.EMBED_COLOR_COMPLETE
             if (finish_reason

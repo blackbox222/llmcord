@@ -15,7 +15,7 @@ class Config:
     def __init__(self, filename: str = "config.yaml") -> None:
         self._filename = filename
         self._data: dict[str, Any] = {}
-        self._system_prompt_name: str = "system"
+        self._system_prompt_name: str = ""
         self._model_settings: dict[str, float] = {
             "temperature": 1.0,
             "top_p": 0.95,
@@ -47,6 +47,9 @@ class Config:
         for key in self._model_settings:
             if key in self._data:
                 self._model_settings[key] = float(self._data[key])
+
+        if not self._system_prompt_name:
+            self._system_prompt_name = self._data.get("system_prompt_name", "system")
 
     def get_system_prompt(self, name: str) -> str:
         """Load a system prompt file by name (without extension)."""

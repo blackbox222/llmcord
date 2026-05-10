@@ -11,6 +11,7 @@ EMBED_COLOR_INCOMPLETE = Color.orange()
 
 # Streaming and editing
 STREAMING_INDICATOR = " 💬 "
+TOOL_INDICATOR = "> 🛠️ "
 MAX_MESSAGE_LENGTH = 4096 - len(STREAMING_INDICATOR)
 RATE_LIMIT_SECONDS = 1.0
 
@@ -20,4 +21,4 @@ MAX_TOKENS = 2048
 
 # Special tokens and LLM finish reasons
 EMPTY_THOUGHT = '<|channel>thought\n<channel|>'
-GOOD_FINISHES = ("stop", "end_turn")
+GOOD_FINISHES = ("stop", "end_turn", "tool_calls")

@@ -7,6 +7,7 @@ import asyncio
 import io
 import logging
 import time
+from typing import Any
 
 import discord
 import openai
@@ -48,7 +49,7 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
     api_key = provider_config.get("api_key", "sk-no-key-required")
     openai_client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
 
-    model_parameters = ctx.config.data.get("models", {}).get(ctx.model_name, {})
+    model_parameters: dict[str, Any] = ctx.config.data.get("models", {}).get(ctx.model_name, {})
 
     # TODO
     extra_headers = provider_config.get("extra_headers")
@@ -71,9 +72,14 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
     try:
         async with msg.channel.typing():
             text = io.StringIO()
+            tool_id = ""
+            tool_name = ""
+            tool_args = io.StringIO()
+
             finish_reason: str | None = None
             usage: tuple[int, int] | None = None
             cur_reply: discord.Message | None = None
+            cur_reply_lock = asyncio.Lock()
             start_time = time.time()
             last_update_time = 0.0
 
@@ -88,11 +94,12 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                     await asyncio.sleep(wait_time)
 
                 # Reply or edit existing reply, avoid cancelling inflight HTTP requests
-                if cur_reply:
-                    cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
-                else:
-                    cur_reply = await asyncio.shield(msg.reply(embed=embed, silent=True))
-                last_update_time = cur_time
+                async with cur_reply_lock:
+                    if cur_reply:
+                        cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
+                    else:
+                        cur_reply = await asyncio.shield(msg.reply(embed=embed, silent=True))
+                    last_update_time = cur_time
 
             async for response in llm.generate(
                 client=openai_client,
@@ -111,22 +118,41 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                     part = response.content.popleft()
 
                     # If adding this part would exceed Discord's length limit, finish this and start a new one
-                    if (text.tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
-                        log.info("Splitting at message limit with response length %d", text.tell())
-                        await _update(formatters.format_embed(text.getvalue(), finish_reason, usage))
+                    if (text.tell() + tool_args.tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
+                        log.info("Splitting at message limit with %d chars", text.tell())
+                        await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
                         text = io.StringIO()
                     text.write(part)
+
+                # Tool calls and arguments
+                for id, args in response.tool_calls.items():
+                    tool_id = id
+                    while args:
+                        part = args.popleft()
+
+                        # If adding this part would exceed Discord's length limit, finish this and start a new one
+                        if (text.tell() + tool_args.tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
+                            log.info("Splitting at message limit with %d chars", text.tell())
+                            await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
+                            tool_args = io.StringIO()
+                        tool_args.write(part)
+
+                    if response.tool_names:
+                        tool_name = response.tool_names[id]
+
+                    log.info("tool call %s: %s %s", tool_id, tool_name, tool_args.getvalue())
+
 
                 cur_time = time.monotonic()
                 if not last_update_time or (cur_time - last_update_time) > constants.RATE_LIMIT_SECONDS:
                     # Enqueue an update with the current (partial) response
-                    log.info("Updating message with response length %d", text.tell())
-                    await _update(formatters.format_embed(text.getvalue(), finish_reason, usage))
+                    log.info("Updating message with %d chars", text.tell())
+                    await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
 
             # Trigger a final update to avoid missing any updates that were rate limited
             elapsed = time.time() - start_time
-            log.info("LLM completion done in %.2f s, finishing update", elapsed)
-            await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, elapsed))
+            log.info("LLM completion done in %.2f s, finishing update of %d chars", elapsed, text.tell())
+            await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, elapsed, tool_name, tool_args.getvalue()))
 
     except Exception:
         log.exception("Error while generating response")
