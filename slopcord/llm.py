@@ -32,6 +32,7 @@ async def generate(
     model_params: dict[str, Any],
     system_prompt: str,
     messages: list[dict[str, Any]],
+    tool_messages: list[dict[str, Any]]
 ) -> AsyncGenerator[Response]:
     """Generate responses from the LLM, yielding updated Response objects as new chunks arrive."""
     system_turns = [dict(content=system_prompt, role="system")]
@@ -40,7 +41,7 @@ async def generate(
     cur_tool_id = ""
 
     async for chunk in await client.chat.completions.create(
-        messages=system_turns + messages[::-1],
+        messages=system_turns + messages[::-1] + tool_messages[::-1],
         model=model_name,
         max_completion_tokens=constants.MAX_TOKENS,
         max_tokens=constants.MAX_TOKENS,

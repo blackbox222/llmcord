@@ -4,6 +4,7 @@ Orchestrates on_ready and on_message, delegating to other modules.
 """
 
 import asyncio
+from collections import defaultdict
 import io
 import logging
 import time
@@ -57,102 +58,140 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
     accept_images = any(tag in ctx.model_name.lower()
                         for tag in constants.VISION_MODEL_TAGS)
 
-    # Fetch message chain
-    msg_chain = messages.MessageChain(ctx, msg)
-    await msg_chain.build()
-    log.info(
-        "handling message (%d attachments, %d chained) <@%d>: %s",
-        len(msg.attachments),
-        len(msg_chain.messages),
-        msg.author.id,
-        msg.content)
-
     system_prompt = ctx.config.get_system_prompt(ctx.config.system_prompt_name)
 
     try:
-        async with msg.channel.typing():
-            text = io.StringIO()
-            tool_id = ""
-            tool_name = ""
-            tool_args = io.StringIO()
+        cur_reply: discord.Message | None = None
+        cur_reply_lock = asyncio.Lock()
+        last_update_time = 0.0
+        tool_names: defaultdict[str, str] = defaultdict(str)
+        tool_args: defaultdict[str, io.StringIO] = defaultdict(io.StringIO)
+        tool_messages = []
+        parent_msg = msg
+        start_time = time.time()
 
-            finish_reason: str | None = None
-            usage: tuple[int, int] | None = None
-            cur_reply: discord.Message | None = None
-            cur_reply_lock = asyncio.Lock()
-            start_time = time.time()
-            last_update_time = 0.0
+        for i in range(5):
+            # Fetch message chain
+            msg_chain = messages.MessageChain(ctx, parent_msg)
+            await msg_chain.build()
+            log.info(
+                "iteration %d: handling message (%d attachments, %d chained) <@%d>: %s",
+                i,
+                len(parent_msg.attachments),
+                len(msg_chain.messages),
+                parent_msg.author.id,
+                parent_msg.content)
 
-            async def _update(embed: discord.Embed) -> None:
-                nonlocal cur_reply, last_update_time
+            async with parent_msg.channel.typing():
+                text = io.StringIO()
+                tool_id = ""
 
-                # Avoid updating messages too frequently
-                cur_time = time.monotonic()
-                if (last_update_time and
-                    (wait_time := cur_time - last_update_time) < constants.RATE_LIMIT_SECONDS):
-                    log.info("waiting %d ms to update", wait_time * 1000)
-                    await asyncio.sleep(wait_time)
+                finish_reason: str | None = None
+                usage: tuple[int, int] | None = None
 
-                # Reply or edit existing reply, avoid cancelling inflight HTTP requests
-                async with cur_reply_lock:
-                    if cur_reply:
-                        cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
-                    else:
-                        cur_reply = await asyncio.shield(msg.reply(embed=embed, silent=True))
-                    last_update_time = cur_time
+                async def _update(embed: discord.Embed, final_edit: bool = False) -> None:
+                    nonlocal parent_msg, cur_reply, last_update_time
 
-            async for response in llm.generate(
-                client=openai_client,
-                model_name=model,
-                model_params=model_parameters,
-                system_prompt=system_prompt,
-                messages=msg_chain.messages
-            ):
-                if response.finish_reason:
-                    finish_reason = response.finish_reason
-                if response.usage:
-                    usage = response.usage
+                    # Avoid updating messages too frequently
+                    cur_time = time.monotonic()
+                    if (last_update_time and
+                        (wait_time := cur_time - last_update_time) < constants.RATE_LIMIT_SECONDS):
+                        log.info("waiting %d ms to update", wait_time * 1000)
+                        await asyncio.sleep(wait_time)
 
-                # Accumulate content parts until we run out or hit the message length limit, then send an update
-                while response.content:
-                    part = response.content.popleft()
+                    # Reply or edit existing reply, avoid cancelling inflight HTTP requests
+                    async with cur_reply_lock:
+                        if cur_reply:
+                            cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
+                        else:
+                            cur_reply = await asyncio.shield(parent_msg.reply(embed=embed, silent=True))
+                        if final_edit:
+                            parent_msg = cur_reply
+                            cur_reply = None
+                        last_update_time = cur_time
 
-                    # If adding this part would exceed Discord's length limit, finish this and start a new one
-                    if (text.tell() + tool_args.tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
-                        log.info("Splitting at message limit with %d chars", text.tell())
-                        await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
-                        text = io.StringIO()
-                    text.write(part)
+                async for response in llm.generate(
+                    client=openai_client,
+                    model_name=model,
+                    model_params=model_parameters,
+                    system_prompt=system_prompt,
+                    messages=msg_chain.messages,
+                    tool_messages=tool_messages
+                ):
+                    if response.finish_reason:
+                        finish_reason = response.finish_reason
+                    if response.usage:
+                        usage = response.usage
 
-                # Tool calls and arguments
-                for id, args in response.tool_calls.items():
-                    tool_id = id
-                    while args:
-                        part = args.popleft()
+                    # Accumulate content parts until we run out or hit the message length limit, then send an update
+                    while response.content:
+                        part = response.content.popleft()
 
                         # If adding this part would exceed Discord's length limit, finish this and start a new one
-                        if (text.tell() + tool_args.tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
+                        if (text.tell() + tool_args[tool_id].tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
                             log.info("Splitting at message limit with %d chars", text.tell())
-                            await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
-                            tool_args = io.StringIO()
-                        tool_args.write(part)
+                            await _update(
+                                formatters.format_embed(
+                                    text.getvalue(), "message_split", usage,
+                                    tool_name=tool_names[tool_id] if tool_id else None,
+                                    tool_args=tool_args[tool_id].getvalue() if tool_id else None),
+                                final_edit=True)
+                            text = io.StringIO()
+                            tool_args[tool_id] = io.StringIO()
+                        text.write(part)
 
-                    if response.tool_names:
-                        tool_name = response.tool_names[id]
+                    # Tool calls and arguments
+                    for id, args in response.tool_calls.items():
+                        tool_id = id
+                        if tool_id:
+                            while args:
+                                part = args.popleft()
 
-                    log.info("tool call %s: %s %s", tool_id, tool_name, tool_args.getvalue())
+                                # If adding this part would exceed Discord's length limit, finish this and start a new one
+                                if (text.tell() + tool_args[tool_id].tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
+                                    log.info("Splitting at message limit with %d chars", text.tell())
+                                    await _update(
+                                        formatters.format_embed(
+                                            text.getvalue(), "message_split", usage,
+                                            tool_name=tool_names[tool_id] if tool_id else None,
+                                            tool_args=tool_args[tool_id].getvalue() if tool_id else None),
+                                        final_edit=True)
+                                    text = io.StringIO()
+                                    tool_args[tool_id] = io.StringIO()
+                                tool_args[tool_id].write(part)
 
+                            if response.tool_names:
+                                tool_names[tool_id] = response.tool_names[id]
 
-                cur_time = time.monotonic()
-                if not last_update_time or (cur_time - last_update_time) > constants.RATE_LIMIT_SECONDS:
-                    # Enqueue an update with the current (partial) response
-                    log.info("Updating message with %d chars", text.tell())
-                    await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, tool_name=tool_name, tool_args=tool_args.getvalue()))
+                    cur_time = time.monotonic()
+                    if not last_update_time or (cur_time - last_update_time) > constants.RATE_LIMIT_SECONDS:
+                        # Enqueue an update with the current (partial) response
+                        log.info("Updating message with %d chars", text.tell())
+                        await _update(
+                            formatters.format_embed(
+                                text.getvalue(), finish_reason, usage,
+                                tool_name=tool_names[tool_id] if tool_id else None,
+                                tool_args=tool_args[tool_id].getvalue() if tool_id else None))
 
-            # Trigger a final update to avoid missing any updates that were rate limited
-            elapsed = time.time() - start_time
-            log.info("LLM completion done in %.2f s, finishing update of %d chars", elapsed, text.tell())
-            await _update(formatters.format_embed(text.getvalue(), finish_reason, usage, elapsed, tool_name, tool_args.getvalue()))
+                # Trigger a final update to avoid missing any updates that were rate limited
+                elapsed = time.time() - start_time
+                log.info("LLM completion done in %.2f s, finishing update of %d chars", elapsed, text.tell())
+                await _update(
+                    formatters.format_embed(
+                        text.getvalue(), finish_reason, usage, elapsed,
+                        tool_names[tool_id] if tool_id else None,
+                        tool_args[tool_id].getvalue() if tool_id else None))
+                if cur_reply:
+                    parent_msg = cur_reply
+                    cur_reply = None
+
+                # If the LLM called tools, evaluate those now so we can loop again and re-trigger generation with the tool outputs
+                if response.finish_reason == "tool_calls":
+                    for id, name in tool_names.items():
+                        log.info("handling tool call %s for tool %s: %s", id, name, tool_args[id].getvalue())
+                        tool_messages.append(dict(role="tool", content=f"ERROR: not implemented yet", tool_call_id=id))
+                else:
+                    break
 
     except Exception:
         log.exception("Error while generating response")

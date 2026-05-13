@@ -30,25 +30,34 @@ def format_embed(
 
     desc = io.StringIO()
     desc.write(format_response(text))
-    if tool_name and tool_args:
-        desc.write(constants.TOOL_INDICATOR)
-        desc.write(f"calling `{tool_name}`: `{tool_args}`\n")
+
     if not finish_reason:
+        color = constants.EMBED_COLOR_INCOMPLETE
         desc.write(constants.STREAMING_INDICATOR)
+    elif finish_reason == "length":
+        color = constants.EMBED_COLOR_LENGTH
+    elif finish_reason in constants.GOOD_FINISHES:
+        color = constants.EMBED_COLOR_COMPLETE
+    else:
+        color = constants.EMBED_COLOR_ERROR
 
     embed = discord.Embed(
         description=desc.getvalue(),
-        color=(
-            constants.EMBED_COLOR_COMPLETE
-            if (finish_reason
-                and finish_reason.lower() in constants.GOOD_FINISHES)
-            else constants.EMBED_COLOR_INCOMPLETE
-        ),
-    )
+        color=color)
+
+    if tool_name and tool_args:
+        field_name = f"{constants.TOOL_INDICATOR} calling `{tool_name}`"
+        field_value = f"`{tool_args}`"
+        embed.add_field(name=field_name, value=field_value, inline=False)
 
     footer_parts = []
-    if finish_reason and finish_reason not in constants.GOOD_FINISHES:
-        footer_parts.append(f"unknown finish reason \"{finish_reason}\"")
+    if finish_reason:
+        if finish_reason == "length":
+            footer_parts.append("stopping due to length limit")
+        elif finish_reason == "message_split":
+            footer_parts.append("(continued below...)")
+        elif finish_reason not in constants.GOOD_FINISHES:
+            footer_parts.append(f"unknown finish reason \"{finish_reason}\"")
     if usage:
         input_tokens, output_tokens = usage
         footer_parts.append(f"{input_tokens} input / {output_tokens} output tokens")

@@ -8,10 +8,12 @@ VISION_MODEL_TAGS = ("claude", "gemini", "gemma", "gpt-4", "gpt-5", "grok-4", "l
 # Embed colors
 EMBED_COLOR_COMPLETE = Color.dark_green()
 EMBED_COLOR_INCOMPLETE = Color.orange()
+EMBED_COLOR_LENGTH = Color.yellow()
+EMBED_COLOR_ERROR = Color.red()
 
 # Streaming and editing
 STREAMING_INDICATOR = " 💬 "
-TOOL_INDICATOR = "> 🛠️ "
+TOOL_INDICATOR = "🛠️"
 MAX_MESSAGE_LENGTH = 4096 - len(STREAMING_INDICATOR)
 RATE_LIMIT_SECONDS = 1.0
 
@@ -21,4 +23,4 @@ MAX_TOKENS = 2048
 
 # Special tokens and LLM finish reasons
 EMPTY_THOUGHT = '<|channel>thought\n<channel|>'
-GOOD_FINISHES = ("stop", "end_turn", "tool_calls")
+GOOD_FINISHES = frozenset(("stop", "end_turn", "tool_calls", "message_split"))
