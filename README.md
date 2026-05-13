@@ -108,12 +108,12 @@ Set up a venv for slopcord:
 ```shell
 uv venv --managed-python -p 3.13
 . .venv/bin/activate
-uv pip install -U -r requirements.txt
+uv sync
 ```
 
 ## Running
 ```shell
-python -m slopcord
+uv run -m slopcord
 ```
 
 ### Flags

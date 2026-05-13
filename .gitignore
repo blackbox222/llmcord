@@ -3,6 +3,7 @@
 *
 
 !.gitignore
+!.python-version
 
 !*.md
 !*.py
@@ -15,4 +16,5 @@ prompts/*
 !Dockerfile
 !config-example.yaml
 !docker-compose.yaml
-!requirements.txt
+!pyproject.toml
+!uv.lock
