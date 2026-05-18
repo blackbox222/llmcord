@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 import httpx
 
-from . import commands as cmd_module, configs, events, globals, tools
+from . import commands as cmd_module, configs, events, globals, tools, vfs
 
 
 async def main(argv: list[str]) -> int:
@@ -19,6 +19,7 @@ async def main(argv: list[str]) -> int:
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--invisible", action='store_true', default=False)
     parser.add_argument("--tools_config", default="tools.yaml")
+    parser.add_argument("--http_debug", action="store_true", default=False)
     args = parser.parse_args(argv)
 
     # Configure logging with a queue to avoid blocking the event loop
@@ -32,6 +33,7 @@ async def main(argv: list[str]) -> int:
     )
 
     with logging.handlers.QueueListener(log_queue, log_handler):
+        log = logging.getLogger(__name__)
         config = configs.Config(args.config)
 
         # Initialize bot
@@ -45,12 +47,20 @@ async def main(argv: list[str]) -> int:
             status=discord.Status.invisible if args.invisible else discord.Status.online,
             command_prefix="")
 
-        httpx_client = httpx.AsyncClient()
+        if args.http_debug:
+            async def resp_hook(resp: httpx.Response):
+                data = await resp.aread()
+                log.info('resp: %s', data.decode('utf-8', 'ignore'))
+
+            httpx_client = httpx.AsyncClient(event_hooks=dict(response=[resp_hook]))
+        else:
+            httpx_client = httpx.AsyncClient()
 
         # Make the first model the default
         model_name = next(iter(config.data.get("models", {})))
         bot_context = globals.BotContext(bot, config, httpx_client, model_name)
         tools.load_tools(bot_context, args.tools_config)
+        bot_context.vfs = vfs.create_vfs()
 
         # Register commands
         cmd_module.register_commands(bot_context, model_name)

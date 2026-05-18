@@ -5,6 +5,7 @@ Orchestrates on_ready and on_message, delegating to other modules.
 
 import asyncio
 from collections import defaultdict
+import copy
 import io
 import logging
 import time
@@ -12,122 +13,243 @@ from typing import Any
 
 import discord
 import openai
+from openai.types import chat
 
-from . import constants, formatters, globals, llm, messages, permissions, tools
+from . import agent, constants, formatters, globals, llm, messages, permissions, tools
 
 log = logging.getLogger(__name__)
 
 
 async def on_ready(ctx: globals.BotContext) -> None:
-    """Handle bot ready event."""
-    ctx.config.reload()
+  """Handle bot ready event."""
+  ctx.config.reload()
 
-    if client_id := ctx.config.data.get("client_id", None):
-        log.info(
-            "READY: invite URL: https://discord.com/oauth2/authorize?client_id=%s&permissions=412317191168&scope=bot",
-            client_id)
+  if client_id := ctx.config.data.get("client_id", None):
+    log.info(
+      "READY: invite URL: https://discord.com/oauth2/authorize?client_id=%s&permissions=412317191168&scope=bot",
+      client_id)
 
-    await ctx.bot.tree.sync()
+  await ctx.bot.tree.sync()
 
 
 async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
-    """Handle incoming messages."""
-    # Reload config for permissions
-    ctx.config.reload()
+  """Handle incoming messages."""
+  # Reload config for permissions
+  ctx.config.reload()
 
-    # Permission checks (includes mention/DM/author checks)
-    perm_data = ctx.config.data.get("permissions", {})
-    allow_dms = ctx.config.data.get("allow_dms", True)
+  # Permission checks (includes mention/DM/author checks)
+  perm_data = ctx.config.data.get("permissions", {})
+  allow_dms = ctx.config.data.get("allow_dms", True)
 
-    if not permissions.is_allowed(msg, ctx.bot.user, perm_data, allow_dms):
-        return
+  if not permissions.is_allowed(msg, ctx.bot.user, perm_data, allow_dms):
+    return
 
-    # Setup model and provider
-    provider, model = ctx.model_name.removesuffix(":vision").split("/", 1)
+  # Setup model and provider
+  provider, model = ctx.model_name.removesuffix(":vision").split("/", 1)
 
-    provider_config = ctx.config.data.get("providers", {}).get(provider, {})
-    base_url = provider_config.get("base_url", "")
-    api_key = provider_config.get("api_key", "sk-no-key-required")
-    openai_client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key)
+  provider_config = ctx.config.data.get("providers", {}).get(provider, {})
+  base_url = provider_config.get("base_url", "")
+  api_key = provider_config.get("api_key", "sk-no-key-required")
+  openai_client = openai.AsyncOpenAI(base_url=base_url, api_key=api_key, http_client=ctx.httpx_client)
 
-    model_parameters: dict[str, Any] = ctx.config.data.get("models", {}).get(ctx.model_name, {})
+  model_parameters: dict[str, Any] = ctx.config.data.get("models", {}).get(ctx.model_name, {})
 
-    # TODO
-    extra_headers = provider_config.get("extra_headers")
-    extra_query = provider_config.get("extra_query")
-    accept_images = any(tag in ctx.model_name.lower()
-                        for tag in constants.VISION_MODEL_TAGS)
+  # TODO
+  extra_headers = provider_config.get("extra_headers")
+  extra_query = provider_config.get("extra_query")
+  accept_images = any(tag in ctx.model_name.lower()
+                      for tag in constants.VISION_MODEL_TAGS)
 
-    system_prompt = ctx.config.get_system_prompt(ctx.config.system_prompt_name)
+  system_prompt = ctx.config.get_system_prompt(ctx.config.system_prompt_name)
 
+  msg_chain = messages.MessageChain(ctx, msg)
+  await msg_chain.build()
+  log.info(
+    "handling message (%d attachments, %d chained) <@%d>: %s",
+    len(msg.attachments),
+    len(msg_chain.messages),
+    msg.author.id,
+    msg.content)
+
+  # New "agent" mode
+  if msg.content.startswith('^'):
     try:
-        cur_reply: discord.Message | None = None
+      parent_msg = msg
+      replies = []
+      async with msg.channel.typing():
+        msg_chain = messages.MessageChain(ctx, msg)
+        await msg_chain.build()
+        log.info(
+          "handling message (%d attachments, %d chained) <@%d>: %s",
+          len(msg.attachments),
+          len(msg_chain.messages),
+          msg.author.id,
+          msg.content)
+
+        if not ctx.top_level_agent:
+          full_params = copy.deepcopy(model_parameters)
+          full_params['chat_template_kwargs'] = dict(enable_thinking=True, preserve_thinking=True)
+          a = agent.Agent(ctx,
+            client=openai_client, model_name=model,
+            model_params=full_params, system_prompt=system_prompt,
+            tool_definitions=ctx.tools_config)
+          a.register_tool('list_dir', tools.list_dir)
+          a.register_tool('read_file', tools.read_file)
+          ctx.top_level_agent = a
+
+        embed_text = io.StringIO()
+        iteration = 0
+        stop_details: agent.StopEvent | None = None
+        running_tools = {}
+        warnings = msg_chain.user_warnings
+
+        embed = None
+        cur_reply = None
         cur_reply_lock = asyncio.Lock()
-        last_update_time = 0.0
-        tool_messages = []
-        parent_msg = msg
-        start_time = time.time()
+        last_update_time = 0
 
-        for i in range(5):
-            tool_names: defaultdict[str, str] = defaultdict(str)
-            tool_args: defaultdict[str, io.StringIO] = defaultdict(io.StringIO)
+        async for e in ctx.top_level_agent.run([
+            chat.ChatCompletionUserMessageParam(role="user", content=msg.content[1:])]):
+          log.info('agent event: %s', e)
+          match event_type := e.event_type:
+            case agent.EventType.START:
+              iteration = e.iteration
+            case agent.EventType.TEXT:
+              embed_text.write(e.text)
+            case agent.EventType.REASONING:
+              embed_text.write(e.text)
+            case agent.EventType.STOP:
+              stop_details = e
+            case agent.EventType.TOOL_CALL:
+              running_tools[e.id] = (e.name, e.args)
+            case agent.EventType.TOOL_RESULT:
+              del running_tools[e.id]
+            case _:
+              log.info('unknown agent event: %s', e)
+              warnings.add(f"ERROR: unexpected event type {event_type}")
 
-            # Fetch message chain
-            msg_chain = messages.MessageChain(ctx, parent_msg)
-            await msg_chain.build()
-            log.info(
-                "iteration %d: handling message (%d attachments, %d chained) <@%d>: %s",
-                i,
-                len(parent_msg.attachments),
-                len(msg_chain.messages),
-                parent_msg.author.id,
-                parent_msg.content)
+          embed = formatters.format_embed(
+             embed_text.getvalue()[:4000],
+             finish_reason=stop_details.reason if stop_details else None,
+             usage=stop_details.usage if stop_details else None)
 
-            async with parent_msg.channel.typing():
-                text = io.StringIO()
-                tool_id = ""
+          async def _update(embed: discord.Embed, final_edit: bool = False) -> None:
+            nonlocal parent_msg, cur_reply, last_update_time
 
-                finish_reason: str | None = None
-                usage: tuple[int, int] | None = None
+            # Avoid updating messages too frequently
+            cur_time = time.monotonic()
+            if (last_update_time and
+              (wait_time := cur_time - last_update_time) < constants.RATE_LIMIT_SECONDS):
+              log.info("waiting %d ms to update", wait_time * 1000)
+              await asyncio.sleep(wait_time)
 
-                async def _update(embed: discord.Embed, final_edit: bool = False) -> None:
-                    nonlocal parent_msg, cur_reply, last_update_time
+            # Reply or edit existing reply, avoid cancelling inflight HTTP requests
+            async with cur_reply_lock:
+              if cur_reply:
+                cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
+              else:
+                log.info("started message")
+                cur_reply = await asyncio.shield(parent_msg.reply(embed=embed, silent=True))
+              if final_edit:
+                parent_msg = cur_reply
+                cur_reply = None
+              last_update_time = cur_time
 
-                    # Avoid updating messages too frequently
-                    cur_time = time.monotonic()
-                    if (last_update_time and
-                        (wait_time := cur_time - last_update_time) < constants.RATE_LIMIT_SECONDS):
-                        log.info("waiting %d ms to update", wait_time * 1000)
-                        await asyncio.sleep(wait_time)
+          await _update(embed)
 
-                    # Reply or edit existing reply, avoid cancelling inflight HTTP requests
-                    async with cur_reply_lock:
-                        if cur_reply:
-                            cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
-                        else:
-                            cur_reply = await asyncio.shield(parent_msg.reply(embed=embed, silent=True))
-                        if final_edit:
-                            parent_msg = cur_reply
-                            cur_reply = None
-                        last_update_time = cur_time
+    except Exception as e:
+      log.exception(e)
 
-                async for response in llm.generate(
-                    client=openai_client,
-                    model_name=model,
-                    model_params=model_parameters,
-                    system_prompt=system_prompt,
-                    messages=msg_chain.messages,
-                    tool_defs=ctx.tools_config,
-                    tool_messages=tool_messages
-                ):
-                    if response.finish_reason:
-                        finish_reason = response.finish_reason
-                    if response.usage:
-                        usage = response.usage
+    return
 
-                    # Accumulate content parts until we run out or hit the message length limit, then send an update
-                    while response.content:
-                        part = response.content.popleft()
+  try:
+    cur_reply: discord.Message | None = None
+    cur_reply_lock = asyncio.Lock()
+    last_update_time = 0.0
+    tool_messages = []
+    parent_msg = msg
+    start_time = time.time()
+
+    for i in range(5):
+      tool_names: defaultdict[str, str] = defaultdict(str)
+      tool_args: defaultdict[str, io.StringIO] = defaultdict(io.StringIO)
+
+      # Fetch message chain
+      msg_chain = messages.MessageChain(ctx, parent_msg)
+      await msg_chain.build()
+      log.info(
+        "iteration %d: handling message (%d attachments, %d chained) <@%d>: %s",
+        i,
+        len(parent_msg.attachments),
+        len(msg_chain.messages),
+        parent_msg.author.id,
+        parent_msg.content)
+
+      async with parent_msg.channel.typing():
+        text = io.StringIO()
+        tool_id = ""
+
+        finish_reason: str | None = None
+        usage: tuple[int, int] | None = None
+
+        async def _update(embed: discord.Embed, final_edit: bool = False) -> None:
+          nonlocal parent_msg, cur_reply, last_update_time
+
+          # Avoid updating messages too frequently
+          cur_time = time.monotonic()
+          if (last_update_time and
+            (wait_time := cur_time - last_update_time) < constants.RATE_LIMIT_SECONDS):
+            log.info("waiting %d ms to update", wait_time * 1000)
+            await asyncio.sleep(wait_time)
+
+          # Reply or edit existing reply, avoid cancelling inflight HTTP requests
+          async with cur_reply_lock:
+            if cur_reply:
+              cur_reply = await asyncio.shield(cur_reply.edit(embed=embed))
+            else:
+              cur_reply = await asyncio.shield(parent_msg.reply(embed=embed, silent=True))
+            if final_edit:
+              parent_msg = cur_reply
+              cur_reply = None
+            last_update_time = cur_time
+
+        async for response in llm.generate(
+          client=openai_client,
+          model_name=model,
+          model_params=model_parameters,
+          system_prompt=system_prompt,
+          messages=msg_chain.messages,
+          tool_defs=ctx.tools_config,
+          tool_messages=tool_messages,
+          reverse_messages=True
+        ):
+            if response.finish_reason:
+                finish_reason = response.finish_reason
+            if response.usage:
+                usage = response.usage
+
+            # Accumulate content parts until we run out or hit the message length limit, then send an update
+            while response.content:
+                part = response.content.popleft()
+
+                # If adding this part would exceed Discord's length limit, finish this and start a new one
+                if (text.tell() + tool_args[tool_id].tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
+                    log.info("Splitting at message limit with %d chars", text.tell())
+                    await _update(
+                        formatters.format_embed(
+                            text.getvalue(), "message_split", usage,
+                            tool_names=tool_names, tool_args=tool_args),
+                        final_edit=True)
+                    text = io.StringIO()
+                    tool_args[tool_id] = io.StringIO()
+                text.write(part)
+
+            # Tool calls and arguments
+            for id, args in response.tool_calls.items():
+                tool_id = id
+                if tool_id:
+                    while args:
+                        part = args.popleft()
 
                         # If adding this part would exceed Discord's length limit, finish this and start a new one
                         if (text.tell() + tool_args[tool_id].tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
@@ -139,63 +261,44 @@ async def on_message(ctx: globals.BotContext, msg: discord.Message) -> None:
                                 final_edit=True)
                             text = io.StringIO()
                             tool_args[tool_id] = io.StringIO()
-                        text.write(part)
+                        tool_args[tool_id].write(part)
 
-                    # Tool calls and arguments
-                    for id, args in response.tool_calls.items():
-                        tool_id = id
-                        if tool_id:
-                            while args:
-                                part = args.popleft()
+                    if response.tool_names:
+                        tool_names[tool_id] = response.tool_names[id]
 
-                                # If adding this part would exceed Discord's length limit, finish this and start a new one
-                                if (text.tell() + tool_args[tool_id].tell() + len(part)) > constants.MAX_MESSAGE_LENGTH:
-                                    log.info("Splitting at message limit with %d chars", text.tell())
-                                    await _update(
-                                        formatters.format_embed(
-                                            text.getvalue(), "message_split", usage,
-                                            tool_names=tool_names, tool_args=tool_args),
-                                        final_edit=True)
-                                    text = io.StringIO()
-                                    tool_args[tool_id] = io.StringIO()
-                                tool_args[tool_id].write(part)
-
-                            if response.tool_names:
-                                tool_names[tool_id] = response.tool_names[id]
-
-                    cur_time = time.monotonic()
-                    if not last_update_time or (cur_time - last_update_time) > constants.RATE_LIMIT_SECONDS:
-                        # Enqueue an update with the current (partial) response
-                        log.info("Updating message with %d chars", text.tell())
-                        await _update(
-                            formatters.format_embed(
-                                text.getvalue(), finish_reason, usage,
-                                tool_names=tool_names, tool_args=tool_args))
-
-                # Trigger a final update to avoid missing any updates that were rate limited
-                elapsed = time.time() - start_time
-                log.info("LLM completion done in %.2f s, finishing update of %d chars", elapsed, text.tell())
+            cur_time = time.monotonic()
+            if not last_update_time or (cur_time - last_update_time) > constants.RATE_LIMIT_SECONDS:
+                # Enqueue an update with the current (partial) response
+                log.info("Updating message with %d chars", text.tell())
                 await _update(
                     formatters.format_embed(
-                        text.getvalue(), finish_reason, usage, elapsed,
-                        tool_names, tool_args))
-                if cur_reply:
-                    parent_msg = cur_reply
-                    cur_reply = None
+                        text.getvalue(), finish_reason, usage,
+                        tool_names=tool_names, tool_args=tool_args))
 
-                # If the LLM called tools, evaluate those now so we can loop again and re-trigger generation with the tool outputs
-                if response.finish_reason == "tool_calls":
-                    for id, name in tool_names.items():
-                        log.info("handling tool call %s for tool %s: %s", id, name, tool_args[id].getvalue())
-                        message = tools.call_tool(ctx, name, tool_args[id].getvalue())
-                        message_lines = message.split('\n')
-                        log.info("tool %s returned message: %s%s", name, message_lines[0], f" ({len(message_lines) - 1} more lines)" if len(message_lines) > 1 else "")
-                        tool_messages.append(dict(role="tool", content=message, tool_call_id=id))
-                else:
-                    break
+        # Trigger a final update to avoid missing any updates that were rate limited
+        elapsed = time.time() - start_time
+        log.info("LLM completion done in %.2f s, finishing update of %d chars", elapsed, text.tell())
+        await _update(
+            formatters.format_embed(
+                text.getvalue(), finish_reason, usage, elapsed,
+                tool_names, tool_args))
+        if cur_reply:
+            parent_msg = cur_reply
+            cur_reply = None
 
-    except Exception:
-        log.exception("Error while generating response")
+        # If the LLM called tools, evaluate those now so we can loop again and re-trigger generation with the tool outputs
+        if response.finish_reason == "tool_calls":
+            for id, name in tool_names.items():
+                log.info("handling tool call %s for tool %s: %s", id, name, tool_args[id].getvalue())
+                message = tools.call_tool(ctx, name, tool_args[id].getvalue())
+                message_lines = message.split('\n')
+                log.info("tool %s returned message: %s%s", name, message_lines[0], f" ({len(message_lines) - 1} more lines)" if len(message_lines) > 1 else "")
+                tool_messages.append(dict(role="tool", content=message, tool_call_id=id))
+        else:
+            break
 
-    # Prune old msg_nodes
-    await messages.prune_cache()
+  except Exception:
+      log.exception("Error while generating response")
+
+  # Prune old msg_nodes
+  await messages.prune_cache()

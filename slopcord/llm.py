@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 class Response:
     """State for an ongoing response generation."""
     content: deque[str] = field(default_factory=deque)
+    reasoning_content: deque[str] = field(default_factory=deque)
     finish_reason: str | None = None
     usage: tuple[int, int] | None = None
     tool_calls: defaultdict[str, deque[str]] = field(default_factory=lambda: defaultdict(deque))
@@ -34,6 +35,7 @@ async def generate(
     messages: list[dict[str, Any]],
     tool_defs: list[Any],
     tool_messages: list[dict[str, Any]],
+    reverse_messages: bool = False
 ) -> AsyncGenerator[Response]:
     """Generate responses from the LLM, yielding updated Response objects as new chunks arrive."""
     system_turns = [dict(content=system_prompt, role="system")]
@@ -41,8 +43,13 @@ async def generate(
 
     cur_tool_id = ""
 
+    if reverse_messages:
+        messages = system_turns + messages[::-1] + tool_messages[::-1]
+    else:
+        messages = system_turns + messages + tool_messages
+
     async for chunk in await client.chat.completions.create(
-        messages=system_turns + messages[::-1] + tool_messages[::-1],
+        messages=messages,
         model=model_name,
         max_completion_tokens=constants.MAX_TOKENS,
         max_tokens=constants.MAX_TOKENS,
@@ -51,14 +58,16 @@ async def generate(
         stream_options=dict(include_usage=True),
         tools=tool_defs,
         tool_choice="auto",
-
-        **(model_params or {}),
+        extra_body=model_params or None,
     ):
         chunk: chat.ChatCompletionChunk
 
         if choice := chunk.choices[0] if chunk.choices else None:
             if choice.delta.content:
                 response.content.append(choice.delta.content)
+            if choice.delta.__pydantic_extra__:
+                if reasoning := choice.delta.__pydantic_extra__.get('reasoning_content', None):
+                    response.reasoning_content.append(reasoning)
 
             if choice.delta.tool_calls:
                 for tool in choice.delta.tool_calls:

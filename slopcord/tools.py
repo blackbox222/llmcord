@@ -5,16 +5,46 @@ import json
 import logging
 import yaml
 
+import fs
+import fs.wrap
+
 from . import globals
 
 
 log = logging.getLogger(__name__)
 
 
+async def list_dir(ctx: globals.BotContext, **kwargs) -> str:
+    path = kwargs.get('filePath', '/')
+    if ctx.vfs:
+        return '\n'.join(ctx.vfs.listdir(path))
+    return 'ERROR: virtual file system not initialized'
+
+
+async def read_file(ctx: globals.BotContext, **kwargs) -> str:
+    path = kwargs.get('filePath', '/')
+    if ctx.vfs:
+        return ctx.vfs.readtext(path, 'utf-8', 'replace')
+    return 'ERROR: virtual file system not initialized'
+
+
+TOOL_IMPLS = {
+    'read_file': read_file,
+    'list_dir': list_dir
+}
+
+
 def load_tools(ctx: globals.BotContext, filename: str):
     """Read the tools config file."""
     with open(filename, 'rt') as f:
-        ctx.tools_config = yaml.safe_load(f.read())
+        tools = yaml.safe_load(f.read())
+        ctx.tools_config = []
+        if tools:
+            for tool in tools:
+                if tool.get('type', '') == 'function' and (func := tool.get('function', None)):
+                    if (name := func.get('name', '')) in ctx.config.data.get('enabled_tools', []):
+                        log.info('enabling tool %s', name)
+                        ctx.tools_config.append(tool)
 
 
 def call_tool(ctx: globals.BotContext, tool_name: str, tool_args: str) -> str:
@@ -24,6 +54,8 @@ def call_tool(ctx: globals.BotContext, tool_name: str, tool_args: str) -> str:
     allowed_dirs = ctx.config.data.get('allowed_dirs', [])
     if tool_name not in enabled_tools:
         return f"ERROR: tool not found: {tool_name}"
+    if tool_name not in TOOL_IMPLS:
+        return f"ERROR: tool not implemented: {tool_name}"
 
     try:
         allowed_paths = set()
